@@ -1,0 +1,8 @@
+[package]
+name = "alsa-test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alsa = "0.9.1"
+libc = "0.2.172"
