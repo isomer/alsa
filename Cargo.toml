@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 alsa = "0.9.1"
 libc = "0.2.172"
+tokio = { version = "1.47.1", features = ["full", "io-std", "io-util", "macros", "rt"] }
