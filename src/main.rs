@@ -9,82 +9,77 @@ fn generate_data(buffer: &mut [f32], rate: u32, phase: &mut f32) {
     }
 }
 
-#[tokio::main]
-async fn main() {
-    const DEVICE_NAME: &str = "default";
-    let mut phase: f32 = 0.0;
+struct AlsaPlayback {
+    pcm: alsa::PCM,
+    async_fd: tokio::io::unix::AsyncFd<std::os::fd::RawFd>,
+    poll_fd: libc::pollfd,
+    rate: f32,
+}
 
-    let pcm = alsa::PCM::new(DEVICE_NAME, alsa::Direction::Playback, true)
-        .expect("Failed to open device for playback");
+impl AlsaPlayback {
+    fn new(device: &str) -> Self {
+        let pcm = alsa::PCM::new(device, alsa::Direction::Playback, true)
+            .expect("Failed to open device for playback");
 
-    let hwparams = alsa::pcm::HwParams::any(&pcm).unwrap();
-    hwparams
-        .set_access(alsa::pcm::Access::RWInterleaved)
-        .unwrap();
-    hwparams.set_format(alsa::pcm::Format::FloatLE).unwrap();
-    let rate = hwparams
-        .set_rate_near(44100, alsa::ValueOr::Nearest)
-        .unwrap();
+        let hwparams = alsa::pcm::HwParams::any(&pcm).unwrap();
+        hwparams
+            .set_access(alsa::pcm::Access::RWInterleaved)
+            .unwrap();
+        hwparams.set_format(alsa::pcm::Format::FloatLE).unwrap();
+        let rate = hwparams
+            .set_rate_near(44100, alsa::ValueOr::Nearest)
+            .unwrap();
 
-    println!("Rate: {rate}");
-    hwparams.set_channels(1).unwrap();
+        println!("Rate: {rate}");
+        hwparams.set_channels(1).unwrap();
 
-    pcm.hw_params(&hwparams).expect("Failed to initialise ALSA");
+        pcm.hw_params(&hwparams).expect("Failed to initialise ALSA");
 
-    let fds = alsa::poll::Descriptors::get(&pcm).expect("Couldn't get ALSA PCM FDs");
-    let fd = fds.first().unwrap();
-    let async_fd = tokio::io::unix::AsyncFd::new(fd.fd).expect("couldn't get async fd");
+        let rate = hwparams.get_rate().expect("Couldn't get rate") as f32;
 
-    println!(
-        "fd{}{}{}{}",
-        fd.fd,
-        if fd.events & libc::POLLIN != 0 {
-            " POLLIN"
-        } else {
-            ""
-        },
-        if fd.events & libc::POLLOUT != 0 {
-            " POLLOUT"
-        } else {
-            ""
-        },
-        if fd.events & libc::POLLERR != 0 {
-            " POLLERR"
-        } else {
-            ""
-        },
-    );
+        drop(hwparams);
 
-    let (buffer_size, period_size) = pcm.get_params().unwrap();
+        let fds = alsa::poll::Descriptors::get(&pcm).expect("Couldn't get ALSA PCM FDs");
+        let poll_fd = fds.first().unwrap();
+        let async_fd = tokio::io::unix::AsyncFd::new(poll_fd.fd).expect("couldn't get async fd");
 
-    println!("buffer_size={buffer_size} period_size={period_size}");
-
-    let mut data = [0.0; 65536];
-    let mut to_send = &data[..0];
-
-    let mut output = alsa::Output::buffer_open().expect("couldn't open output");
-    pcm.dump(&mut output).expect("dump failed");
-    println!("{output}");
-
-    loop {
-        if to_send.is_empty() {
-            generate_data(&mut data, rate, &mut phase);
-            to_send = &data;
+        Self {
+            pcm,
+            async_fd,
+            poll_fd: *poll_fd,
+            rate,
         }
+    }
+
+    #[inline]
+    fn get_rate(&self) -> f32 {
+        self.rate
+    }
+
+    fn get_interest(&self) -> tokio::io::Interest {
+        use tokio::io::Interest;
+
         // Even for write only use like this, alsa often requires read events, since it's asking
         // you to wait on a status pipe rather than the underlying audio device.
-        let interest = if fd.events & libc::POLLIN != 0 {
-            tokio::io::Interest::READABLE
-        } else if fd.events & libc::POLLOUT != 0 {
-            tokio::io::Interest::WRITABLE
+
+        if self.poll_fd.events & libc::POLLIN != 0 {
+            Interest::READABLE
+        } else if self.poll_fd.events & libc::POLLOUT != 0 {
+            Interest::WRITABLE
+        } else if self.poll_fd.events & libc::POLLERR != 0 {
+            Interest::ERROR
         } else {
-            panic!("unexpected interest");
-        };
-        let mut guard = async_fd
+            panic!("Unknown interest");
+        }
+    }
+
+    async fn write(&self, mut to_send: &[f32]) -> std::io::Result<()> {
+        let interest = self.get_interest();
+        let mut guard = self
+            .async_fd
             .ready(interest)
             .await
             .expect("Failed to get asyncfd guard");
-
         let io_result = guard.try_io(|_fd| {
             // As this is an example program for async i/o only, we are not handling XRUN or other
             // failures, just aborting to keep the code clear to understand the primary point.
@@ -93,8 +88,8 @@ async fn main() {
             //assert_eq!(current_state, alsa::pcm::State::Running);
 
             let fds = [libc::pollfd {
-                fd: fd.fd,
-                events: fd.events,
+                fd: self.poll_fd.fd,
+                events: self.poll_fd.events,
                 revents: match interest {
                     tokio::io::Interest::READABLE => libc::POLLIN,
                     tokio::io::Interest::WRITABLE => libc::POLLOUT,
@@ -106,14 +101,16 @@ async fn main() {
             // waiting on a status pipe), we need to remap that back to OUT, some alsa plugins
             // rely on this to perform some internal book keeping updates.  This does that.
             let flags =
-                alsa::poll::Descriptors::revents(&pcm, &fds).expect("Failed to alsa revents");
+                alsa::poll::Descriptors::revents(&self.pcm, &fds).expect("Failed to alsa revents");
 
-            pcm.avail_update().expect("Failed to update ALSA avail");
+            self.pcm
+                .avail_update()
+                .expect("Failed to update ALSA avail");
 
             println!("flags={flags:?}");
             if flags.contains(alsa::poll::Flags::OUT) {
-                let frames = pcm.avail().unwrap();
-                let io = pcm.io_f32().unwrap();
+                let frames = self.pcm.avail().unwrap();
+                let io = self.pcm.io_f32().unwrap();
                 let count = io
                     .writei(&to_send[..std::cmp::min(frames as usize, to_send.len())])
                     .expect("write failed");
@@ -132,9 +129,39 @@ async fn main() {
         });
 
         match io_result {
-            Ok(Ok(())) => (),
-            Ok(Err(err)) => panic!("error: {err:?}"),
-            Err(_would_block) => {}
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(err),
+            Err(_would_block) => Ok(()),
         }
+    }
+}
+
+impl std::fmt::Debug for AlsaPlayback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut output = alsa::Output::buffer_open().expect("couldn't open output");
+        self.pcm.dump(&mut output).expect("dump failed");
+        f.write_str(&format!("{output}"))
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    const DEVICE_NAME: &str = "default";
+    let mut phase: f32 = 0.0;
+
+    let alsa = AlsaPlayback::new(DEVICE_NAME);
+
+    let mut data = [0.0; 65536];
+    let mut to_send = &data[..0];
+
+    println!("{alsa:?}");
+
+    loop {
+        if to_send.is_empty() {
+            generate_data(&mut data, alsa.get_rate() as u32, &mut phase);
+            to_send = &data;
+        }
+
+        alsa.write(to_send).await.expect("Unexpected error");
     }
 }
