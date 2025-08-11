@@ -9,7 +9,7 @@ fn generate_data(buffer: &mut [f32], rate: f32, phase: &mut f32) {
     }
 }
 
-struct AlsaPlayback {
+pub struct AlsaPlayback {
     pcm: alsa::PCM,
     async_fd: tokio::io::unix::AsyncFd<std::os::fd::RawFd>,
     poll_fd: libc::pollfd,
@@ -17,7 +17,7 @@ struct AlsaPlayback {
 }
 
 impl AlsaPlayback {
-    fn new(device: &str) -> Self {
+    pub fn new(device: &str) -> Self {
         let pcm = alsa::PCM::new(device, alsa::Direction::Playback, true)
             .expect("Failed to open device for playback");
 
@@ -82,14 +82,16 @@ impl std::fmt::Debug for AlsaPlayback {
     }
 }
 
-struct AlsaPlaybackWriter<'p>(&'p AlsaPlayback, alsa::pcm::IO<'p, f32>);
+pub struct AlsaWriter<'p, Sample>(&'p AlsaPlayback, alsa::pcm::IO<'p, Sample>)
+where
+    Sample: alsa::pcm::IoFormat;
 
-impl<'p> AlsaPlaybackWriter<'p> {
-    fn new(playback: &'p AlsaPlayback) -> Self {
+impl<'p, Sample: alsa::pcm::IoFormat> AlsaWriter<'p, Sample> {
+    pub fn new(playback: &'p AlsaPlayback) -> Self {
         Self(playback, playback.pcm.io_checked().expect("Wrong format"))
     }
 
-    async fn write(&self, to_send: &[f32]) -> std::io::Result<usize> {
+    pub async fn write(&self, to_send: &[Sample]) -> std::io::Result<usize> {
         let interest = self.0.get_interest();
         let mut guard = self
             .0
@@ -164,6 +166,97 @@ impl<'p> AlsaPlaybackWriter<'p> {
     }
 }
 
+#[pin_project::pin_project]
+pub struct AlsaSink<'p, Sample>
+where
+    Sample: alsa::pcm::IoFormat,
+{
+    #[pin]
+    writer: AlsaWriter<'p, Sample>,
+    buffer: std::collections::VecDeque<Sample>,
+}
+
+impl<'p, Sample> AlsaSink<'p, Sample>
+where
+    Sample: alsa::pcm::IoFormat,
+{
+    pub fn new(writer: AlsaWriter<'p, Sample>) -> Self {
+        Self {
+            writer,
+            buffer: Default::default(),
+        }
+    }
+}
+
+const BUFFER_SIZE: usize = 65536;
+
+impl<'p, Sample> futures::sink::Sink<Sample> for AlsaSink<'p, Sample>
+where
+    Sample: alsa::pcm::IoFormat,
+{
+    type Error = std::io::Error;
+
+    fn poll_ready(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        use std::task::Poll;
+        let s = self.project();
+        while s.buffer.len() >= BUFFER_SIZE {
+            let (to_send, _) = s.buffer.as_slices();
+            let count = match std::pin::pin!(s.writer.write(to_send)).poll(cx) {
+                Poll::Ready(Ok(count)) => count,
+                Poll::Ready(Err(err)) => {
+                    return Poll::Ready(Err(err));
+                }
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
+            };
+            s.buffer.drain(..count);
+        }
+
+        Poll::Ready(Ok(()))
+    }
+
+    #[inline]
+    fn start_send(self: std::pin::Pin<&mut Self>, item: Sample) -> Result<(), Self::Error> {
+        let s = self.project();
+        s.buffer.push_back(item);
+        Ok(())
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        use std::task::Poll;
+        let s = self.project();
+        while !s.buffer.is_empty() {
+            let (to_send, _) = s.buffer.as_slices();
+            let count = match std::pin::pin!(s.writer.write(to_send)).poll(cx) {
+                Poll::Ready(Ok(count)) => count,
+                Poll::Ready(Err(err)) => {
+                    return Poll::Ready(Err(err));
+                }
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
+            };
+            s.buffer.drain(..count);
+        }
+
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.poll_flush(cx)
+    }
+}
+
 #[tokio::main]
 async fn main() {
     const DEVICE_NAME: &str = "default";
@@ -174,7 +267,7 @@ async fn main() {
     let mut data = [0.0; 65536];
     let mut to_send = &data[..0];
 
-    let writer = AlsaPlaybackWriter::new(&alsa);
+    let writer = AlsaWriter::new(&alsa);
 
     println!("{alsa:?}");
 
