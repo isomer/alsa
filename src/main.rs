@@ -1,11 +1,11 @@
-fn generate_data(buffer: &mut [f32], rate: u32, phase: &mut f32) {
+fn generate_data(buffer: &mut [f32], rate: f32, phase: &mut f32) {
     const FREQUENCY: f32 = 440.0;
     for i in buffer {
-        *i = (*phase * std::f32::consts::TAU * FREQUENCY / (rate as f32)).sin();
+        *i = (*phase * std::f32::consts::TAU * FREQUENCY / rate).sin();
         *phase += 1.0;
     }
-    if *phase > rate as f32 {
-        *phase -= rate as f32;
+    if *phase > rate {
+        *phase -= rate;
     }
 }
 
@@ -26,11 +26,11 @@ impl AlsaPlayback {
             .set_access(alsa::pcm::Access::RWInterleaved)
             .unwrap();
         hwparams.set_format(alsa::pcm::Format::FloatLE).unwrap();
-        let rate = hwparams
+
+        hwparams
             .set_rate_near(44100, alsa::ValueOr::Nearest)
             .unwrap();
 
-        println!("Rate: {rate}");
         hwparams.set_channels(1).unwrap();
 
         pcm.hw_params(&hwparams).expect("Failed to initialise ALSA");
@@ -72,10 +72,27 @@ impl AlsaPlayback {
             panic!("Unknown interest");
         }
     }
+}
 
-    async fn write(&self, mut to_send: &[f32]) -> std::io::Result<()> {
-        let interest = self.get_interest();
+impl std::fmt::Debug for AlsaPlayback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut output = alsa::Output::buffer_open().expect("couldn't open output");
+        self.pcm.dump(&mut output).expect("dump failed");
+        f.write_str(&format!("{output}"))
+    }
+}
+
+struct AlsaPlaybackWriter<'p>(&'p AlsaPlayback, alsa::pcm::IO<'p, f32>);
+
+impl<'p> AlsaPlaybackWriter<'p> {
+    fn new(playback: &'p AlsaPlayback) -> Self {
+        Self(playback, playback.pcm.io_checked().expect("Wrong format"))
+    }
+
+    async fn write(&self, to_send: &[f32]) -> std::io::Result<usize> {
+        let interest = self.0.get_interest();
         let mut guard = self
+            .0
             .async_fd
             .ready(interest)
             .await
@@ -88,59 +105,62 @@ impl AlsaPlayback {
             //assert_eq!(current_state, alsa::pcm::State::Running);
 
             let fds = [libc::pollfd {
-                fd: self.poll_fd.fd,
-                events: self.poll_fd.events,
-                revents: match interest {
-                    tokio::io::Interest::READABLE => libc::POLLIN,
-                    tokio::io::Interest::WRITABLE => libc::POLLOUT,
-                    _ => unimplemented!(),
+                fd: self.0.poll_fd.fd,
+                events: self.0.poll_fd.events,
+                revents: if interest.is_readable() {
+                    libc::POLLIN
+                } else {
+                    0
+                } | if interest.is_writable() {
+                    libc::POLLOUT
+                } else {
+                    0
+                } | if interest.is_error() {
+                    libc::POLLERR
+                } else {
+                    0
                 },
             }];
 
             // Since ALSA may have asked for a POLLIN event for us to write (since it's actually
             // waiting on a status pipe), we need to remap that back to OUT, some alsa plugins
             // rely on this to perform some internal book keeping updates.  This does that.
-            let flags =
-                alsa::poll::Descriptors::revents(&self.pcm, &fds).expect("Failed to alsa revents");
+            let flags = alsa::poll::Descriptors::revents(&self.0.pcm, &fds)
+                .expect("Failed to alsa revents");
 
-            self.pcm
+            self.0
+                .pcm
                 .avail_update()
                 .expect("Failed to update ALSA avail");
 
-            println!("flags={flags:?}");
+            let delay = self.0.pcm.delay().expect("couldn't get delay");
+            let rate = self.0.get_rate();
+            let delay_ms = 1000.0 * delay as f32 / rate;
+
+            println!("flags={flags:?}  delay={delay_ms}ms");
             if flags.contains(alsa::poll::Flags::OUT) {
-                let frames = self.pcm.avail().unwrap();
-                let io = self.pcm.io_f32().unwrap();
-                let count = io
+                let frames = self.0.pcm.avail().unwrap();
+                let count = self
+                    .1
                     .writei(&to_send[..std::cmp::min(frames as usize, to_send.len())])
                     .expect("write failed");
-                to_send = &to_send[count..];
                 println!("{count}");
+                Ok(count)
             } else {
                 // ALSA is NOT ready for writing according to its internal logic (alsa_flags).
                 // Return WouldBlock to prevent the spin: this tells Tokio to re-poll the FD.
-                return Err(std::io::Error::new(
+                Err(std::io::Error::new(
                     std::io::ErrorKind::WouldBlock,
                     "ALSA not ready for write according to its revents flags",
-                ));
+                ))
             }
-
-            Ok(())
         });
 
         match io_result {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(count)) => Ok(count),
             Ok(Err(err)) => Err(err),
-            Err(_would_block) => Ok(()),
+            Err(_would_block) => Ok(0),
         }
-    }
-}
-
-impl std::fmt::Debug for AlsaPlayback {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut output = alsa::Output::buffer_open().expect("couldn't open output");
-        self.pcm.dump(&mut output).expect("dump failed");
-        f.write_str(&format!("{output}"))
     }
 }
 
@@ -154,14 +174,18 @@ async fn main() {
     let mut data = [0.0; 65536];
     let mut to_send = &data[..0];
 
+    let writer = AlsaPlaybackWriter::new(&alsa);
+
     println!("{alsa:?}");
 
     loop {
         if to_send.is_empty() {
-            generate_data(&mut data, alsa.get_rate() as u32, &mut phase);
+            generate_data(&mut data, alsa.get_rate(), &mut phase);
+            println!("phase={phase}");
             to_send = &data;
         }
 
-        alsa.write(to_send).await.expect("Unexpected error");
+        let count = writer.write(to_send).await.expect("Unexpected error");
+        to_send = &to_send[count..];
     }
 }
