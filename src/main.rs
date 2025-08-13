@@ -166,17 +166,17 @@ impl<'p, Sample: alsa::pcm::IoFormat> AlsaWriter<'p, Sample> {
     }
 }
 
-#[pin_project::pin_project]
-pub struct AlsaSink<'p, Sample>
+const BUFFER_SIZE: usize = 65536;
+
+pub struct AlsaBufferedWriter<'p, Sample>
 where
     Sample: alsa::pcm::IoFormat,
 {
-    #[pin]
     writer: AlsaWriter<'p, Sample>,
     buffer: std::collections::VecDeque<Sample>,
 }
 
-impl<'p, Sample> AlsaSink<'p, Sample>
+impl<'p, Sample> AlsaBufferedWriter<'p, Sample>
 where
     Sample: alsa::pcm::IoFormat,
 {
@@ -186,67 +186,61 @@ where
             buffer: Default::default(),
         }
     }
+
+    pub async fn ready(&mut self) -> std::io::Result<()> {
+        while self.buffer.len() >= BUFFER_SIZE {
+            let (to_send, _) = self.buffer.as_slices();
+            let count = self.writer.write(to_send).await?;
+            self.buffer.drain(..count);
+        }
+
+        Ok(())
+    }
+
+    pub fn send(&mut self, sample: Sample) -> std::io::Result<()> {
+        self.buffer.push_back(sample);
+        Ok(())
+    }
+
+    pub async fn flush(&mut self) -> std::io::Result<()> {
+        while !self.buffer.is_empty() {
+            let (to_send, _) = self.buffer.as_slices();
+            let count = self.writer.write(to_send).await?;
+            self.buffer.drain(..count);
+        }
+        Ok(())
+    }
+
+    pub async fn close(&mut self) -> std::io::Result<()> {
+        self.flush().await
+        // TODO: Finish the stream
+    }
 }
 
-const BUFFER_SIZE: usize = 65536;
-
-impl<'p, Sample> futures::sink::Sink<Sample> for AlsaSink<'p, Sample>
+impl<'p, Sample> futures::sink::Sink<Sample> for AlsaBufferedWriter<'p, Sample>
 where
-    Sample: alsa::pcm::IoFormat,
+    Sample: alsa::pcm::IoFormat + Unpin,
 {
     type Error = std::io::Error;
 
     fn poll_ready(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        use std::task::Poll;
-        let s = self.project();
-        while s.buffer.len() >= BUFFER_SIZE {
-            let (to_send, _) = s.buffer.as_slices();
-            let count = match std::pin::pin!(s.writer.write(to_send)).poll(cx) {
-                Poll::Ready(Ok(count)) => count,
-                Poll::Ready(Err(err)) => {
-                    return Poll::Ready(Err(err));
-                }
-                Poll::Pending => {
-                    return Poll::Pending;
-                }
-            };
-            s.buffer.drain(..count);
-        }
-
-        Poll::Ready(Ok(()))
+        let p = std::pin::pin!(self.ready());
+        p.poll(cx)
     }
 
-    #[inline]
     fn start_send(self: std::pin::Pin<&mut Self>, item: Sample) -> Result<(), Self::Error> {
-        let s = self.project();
-        s.buffer.push_back(item);
-        Ok(())
+        std::pin::pin!(self).send(item)
     }
 
     fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        use std::task::Poll;
-        let s = self.project();
-        while !s.buffer.is_empty() {
-            let (to_send, _) = s.buffer.as_slices();
-            let count = match std::pin::pin!(s.writer.write(to_send)).poll(cx) {
-                Poll::Ready(Ok(count)) => count,
-                Poll::Ready(Err(err)) => {
-                    return Poll::Ready(Err(err));
-                }
-                Poll::Pending => {
-                    return Poll::Pending;
-                }
-            };
-            s.buffer.drain(..count);
-        }
-
-        Poll::Ready(Ok(()))
+        let p = std::pin::pin!(self.flush());
+        p.poll(cx)
     }
 
     fn poll_close(
@@ -265,20 +259,33 @@ async fn main() {
     let alsa = AlsaPlayback::new(DEVICE_NAME);
 
     let mut data = [0.0; 65536];
-    let mut to_send = &data[..0];
 
     let writer = AlsaWriter::new(&alsa);
 
-    println!("{alsa:?}");
+    let use_sink = false;
 
-    loop {
-        if to_send.is_empty() {
+    if use_sink {
+        let mut sink = AlsaBufferedWriter::new(writer);
+
+        loop {
             generate_data(&mut data, alsa.get_rate(), &mut phase);
             println!("phase={phase}");
-            to_send = &data;
-        }
 
-        let count = writer.write(to_send).await.expect("Unexpected error");
-        to_send = &to_send[count..];
+            for i in data {
+                use futures::sink::SinkExt as _;
+                sink.feed(i).await.expect("Failed to sink sample");
+            }
+        }
+    } else {
+        let mut buffered = AlsaBufferedWriter::new(writer);
+        loop {
+            generate_data(&mut data, alsa.get_rate(), &mut phase);
+            println!("phase={phase}");
+
+            for i in data {
+                buffered.ready().await.expect("Failed to become ready");
+                buffered.send(i).expect("Failed to send sample");
+            }
+        }
     }
 }
