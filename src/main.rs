@@ -262,7 +262,7 @@ async fn main() {
 
     let writer = AlsaWriter::new(&alsa);
 
-    let use_sink = false;
+    let use_sink = true;
 
     if use_sink {
         let mut sink = AlsaBufferedWriter::new(writer);
